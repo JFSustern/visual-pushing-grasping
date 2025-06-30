@@ -24,9 +24,12 @@ max_iteration = executed_action_log.shape[0]
 executed_action_log = executed_action_log[0:max_iteration,:]
 reward_value_log = np.loadtxt(os.path.join(transitions_directory, 'reward-value.log.txt'), delimiter=' ')
 reward_value_log = reward_value_log[0:max_iteration]
+# 修改后的代码
 clearance_log = np.loadtxt(os.path.join(transitions_directory, 'clearance.log.txt'), delimiter=' ')
+clearance_log = np.atleast_1d(clearance_log)  # 确保 clearance_log 是一维数组
 max_trials = len(clearance_log)
 clearance_log = np.concatenate((np.asarray([0]), clearance_log), axis=0).astype(int)
+
 
 # Count number of pushing/grasping actions before completion
 num_actions_before_completion = clearance_log[1:(max_trials+1)] - clearance_log[0:(max_trials)]

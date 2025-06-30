@@ -8,30 +8,41 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 
 
+# 根据相机内参将深度图像重建3D点云
 def get_pointcloud(color_img, depth_img, camera_intrinsics):
 
-    # Get depth image size
-    im_h = depth_img.shape[0]
-    im_w = depth_img.shape[1]
+    # 获取图像尺寸
+    im_h = depth_img.shape[0]  # 480
+    im_w = depth_img.shape[1]  # 640
 
-    # Project depth into 3D point cloud in camera coordinates
+    # 创建像素坐标网格
     pix_x,pix_y = np.meshgrid(np.linspace(0,im_w-1,im_w), np.linspace(0,im_h-1,im_h))
+
+    # 应用3D点云重建公式
     cam_pts_x = np.multiply(pix_x-camera_intrinsics[0][2],depth_img/camera_intrinsics[0][0])
     cam_pts_y = np.multiply(pix_y-camera_intrinsics[1][2],depth_img/camera_intrinsics[1][1])
+
+    # Z坐标就是深度值
     cam_pts_z = depth_img.copy()
+
+    # 重塑为点云格式
     cam_pts_x.shape = (im_h*im_w,1)
     cam_pts_y.shape = (im_h*im_w,1)
     cam_pts_z.shape = (im_h*im_w,1)
 
-    # Reshape image into colors for 3D point cloud
+    # 提取颜色信息
     rgb_pts_r = color_img[:,:,0]
     rgb_pts_g = color_img[:,:,1]
     rgb_pts_b = color_img[:,:,2]
+
+    # 组合成点云
     rgb_pts_r.shape = (im_h*im_w,1)
     rgb_pts_g.shape = (im_h*im_w,1)
     rgb_pts_b.shape = (im_h*im_w,1)
 
+    # 结果: 307200×3矩阵，每行是一个3D点(X,Y,Z)
     cam_pts = np.concatenate((cam_pts_x, cam_pts_y, cam_pts_z), axis=1)
+    # 结果: 307200×3矩阵，每行是对应的颜色(R,G,B)
     rgb_pts = np.concatenate((rgb_pts_r, rgb_pts_g, rgb_pts_b), axis=1)
 
     return cam_pts, rgb_pts

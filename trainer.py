@@ -15,6 +15,14 @@ import matplotlib.pyplot as plt
 class Trainer(object):
     def __init__(self, method, push_rewards, future_reward_discount,
                  is_testing, load_snapshot, snapshot_file, force_cpu):
+        # method: 模型类型，可选'reactive'（监督学习）或'reinforcement'（强化学习）。
+        # push_rewards: 是否启用推动物体即时奖励机制。
+        # future_reward_discount: 折扣因子，用于未来奖励计算。
+        # is_testing: 测试模式标志。
+        # load_snapshot: 是否加载预训练模型。
+        # snapshot_file: 预训练模型路径。
+        # force_cpu: 是否强制使用CPU。
+
 
         self.method = method
 
@@ -86,7 +94,7 @@ class Trainer(object):
         self.clearance_log = []
 
 
-    # Pre-load execution info and RL variables
+    # 从指定目录中加载已有的训练日志数据
     def preload(self, transitions_directory):
         self.executed_action_log = np.loadtxt(os.path.join(transitions_directory, 'executed-action.log.txt'), delimiter=' ')
         self.iteration = self.executed_action_log.shape[0] - 2
@@ -187,6 +195,7 @@ class Trainer(object):
         return push_predictions, grasp_predictions, state_feat
 
 
+    # 根据当前动作和环境反馈计算目标值
     def get_label_value(self, primitive_action, push_success, grasp_success, change_detected, prev_push_predictions, prev_grasp_predictions, next_color_heightmap, next_depth_heightmap):
 
         if self.method == 'reactive':
@@ -228,6 +237,7 @@ class Trainer(object):
 
             print('Current reward: %f' % (current_reward))
             print('Future reward: %f' % (future_reward))
+            # push是否需要进行即时奖励
             if primitive_action == 'push' and not self.push_rewards:
                 expected_reward = self.future_reward_discount * future_reward
                 print('Expected reward: %f + %f x %f = %f' % (0.0, self.future_reward_discount, future_reward, expected_reward))
@@ -237,7 +247,7 @@ class Trainer(object):
             return expected_reward, current_reward
 
 
-    # Compute labels and backpropagate
+    # 反向传播，更新模型权重
     def backprop(self, color_heightmap, depth_heightmap, primitive_action, best_pix_ind, label_value):
 
         if self.method == 'reactive':
@@ -285,7 +295,9 @@ class Trainer(object):
                 loss.backward()
                 loss_value += loss.cpu().data.numpy()
 
-                # Since grasping is symmetric, train with another forward pass of opposite rotation angle
+                # 机械臂从某个角度抓取一个物体，如果将整个场景旋转 180°，理论上应该能以相同的方式再次抓取。
+
+                #对称角度等于当前角度加上角度数的一半
                 opposite_rotate_idx = (best_pix_ind[0] + self.model.num_rotations/2) % self.model.num_rotations
 
                 push_predictions, grasp_predictions, state_feat = self.forward(color_heightmap, depth_heightmap, is_volatile=False, specific_rotation=opposite_rotate_idx)
@@ -296,7 +308,8 @@ class Trainer(object):
                     loss = self.grasp_criterion(self.model.output_prob[0][1], Variable(torch.from_numpy(label).long()))
                 loss.backward()
                 loss_value += loss.cpu().data.numpy()
-
+                # 前面进行了 两次前向和反向传播（分别对应原始角度和对称角度），所以 loss_value 是两个 loss 的总和
+                # 最终loss是两次loss的平均值（loss_value = loss_value / 2）
                 loss_value = loss_value/2
 
             print('Training loss: %f' % (loss_value))
@@ -368,6 +381,7 @@ class Trainer(object):
             self.optimizer.step()
 
 
+    #可视化模型预测结果
     def get_prediction_vis(self, predictions, color_heightmap, best_pix_ind):
 
         canvas = None
@@ -398,44 +412,59 @@ class Trainer(object):
 
         return canvas
 
-
+    #启发式推动策略
     def push_heuristic(self, depth_heightmap):
 
         num_rotations = 16
-
+        #划分为16个旋转角，即16个推动方向
         for rotate_idx in range(num_rotations):
             rotated_heightmap = ndimage.rotate(depth_heightmap, rotate_idx*(360.0/num_rotations), reshape=False, order=0)
             valid_areas = np.zeros(rotated_heightmap.shape)
+            # 将深度图向左平移25像素（模拟推后的状态）
+            #     如果平移后和原始深度图之间的差大于0.02，则说明该区域发生了明显高度变化，可能是可以推动的物体边缘。把这些区域设置为1，作为“可推”区域。
             valid_areas[ndimage.interpolation.shift(rotated_heightmap, [0,-25], order=0) - rotated_heightmap > 0.02] = 1
+
             # valid_areas = np.multiply(valid_areas, rotated_heightmap)
+
+            # 卷积核 blur_kernel用来对“可推”区域进行模糊处理，去除孤立噪声点。
             blur_kernel = np.ones((25,25),np.float32)/9
+            # 使用blur_kernel核进行卷积让模型更关注连续的大面积“可推”区域。
             valid_areas = cv2.filter2D(valid_areas, -1, blur_kernel)
             tmp_push_predictions = ndimage.rotate(valid_areas, -rotate_idx*(360.0/num_rotations), reshape=False, order=0)
             tmp_push_predictions.shape = (1, rotated_heightmap.shape[0], rotated_heightmap.shape[1])
-
+            # 将16个旋转角度的预测结果拼接起来得到16*h*w的三维图像
             if rotate_idx == 0:
                 push_predictions = tmp_push_predictions
             else:
                 push_predictions = np.concatenate((push_predictions, tmp_push_predictions), axis=0)
-
+        # 从16个旋转角度的预测结果中取到最大的点，该点所在的维度即推动角度，像素坐标即推送位置
         best_pix_ind = np.unravel_index(np.argmax(push_predictions), push_predictions.shape)
         return best_pix_ind
 
 
+    #启发式抓取策略
     def grasp_heuristic(self, depth_heightmap):
 
         num_rotations = 16
-
+        # 划分为16个旋转角，即16个抓取方向
         for rotate_idx in range(num_rotations):
             rotated_heightmap = ndimage.rotate(depth_heightmap, rotate_idx*(360.0/num_rotations), reshape=False, order=0)
             valid_areas = np.zeros(rotated_heightmap.shape)
+            # 同时满足两个条件才认为是“可抓”区域：
+            #     向左移动后高度变大（左边有支撑）
+            #     向右移动后高度也变大（右边也有支撑）
+            # 这样的区域更适合夹爪抓取。
             valid_areas[np.logical_and(rotated_heightmap - ndimage.interpolation.shift(rotated_heightmap, [0,-25], order=0) > 0.02, rotated_heightmap - ndimage.interpolation.shift(rotated_heightmap, [0,25], order=0) > 0.02)] = 1
+
             # valid_areas = np.multiply(valid_areas, rotated_heightmap)
+
+            # 卷积核 blur_kernel用来对“可推”区域进行模糊处理，去除孤立噪声点。
             blur_kernel = np.ones((25,25),np.float32)/9
+            # 使用blur_kernel核进行卷积让模型更关注连续的大面积“可抓”区域。
             valid_areas = cv2.filter2D(valid_areas, -1, blur_kernel)
             tmp_grasp_predictions = ndimage.rotate(valid_areas, -rotate_idx*(360.0/num_rotations), reshape=False, order=0)
             tmp_grasp_predictions.shape = (1, rotated_heightmap.shape[0], rotated_heightmap.shape[1])
-
+            # 将16个旋转角度的预测结果拼接起来得到16*h*w的三维图像
             if rotate_idx == 0:
                 grasp_predictions = tmp_grasp_predictions
             else:

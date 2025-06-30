@@ -134,6 +134,7 @@ class Robot(object):
             self.cam_depth_scale = np.loadtxt('real/camera_depth_scale.txt', delimiter=' ')
 
 
+    #仿真相机参数设置
     def setup_sim_camera(self):
 
         # Get handle to camera
@@ -148,7 +149,12 @@ class Robot(object):
         cam_rotm = np.eye(4,4)
         cam_rotm[0:3,0:3] = np.linalg.inv(utils.euler2rotm(cam_orientation))
         self.cam_pose = np.dot(cam_trans, cam_rotm) # Compute rigid transformation representating camera pose
+
+        # self.cam_intrinsics = np.asarray([[fx, 0, cx],[0, fy, cy],[0, 0, 1]])
+        # fx, fy：焦距（以像素为单位）
+        # cx, cy：主点坐标（图像中心）
         self.cam_intrinsics = np.asarray([[618.62, 0, 320], [0, 618.62, 240], [0, 0, 1]])
+
         self.cam_depth_scale = 1
 
         # Get background image
@@ -307,7 +313,7 @@ class Robot(object):
             sim_ret, resolution, raw_image = vrep.simxGetVisionSensorImage(self.sim_client, self.cam_handle, 0, vrep.simx_opmode_blocking)
             color_img = np.asarray(raw_image)
             color_img.shape = (resolution[1], resolution[0], 3)
-            color_img = color_img.astype(np.float)/255
+            color_img = color_img.astype(np.float64)/255
             color_img[color_img < 0] += 1
             color_img *= 255
             color_img = np.fliplr(color_img)
@@ -646,12 +652,45 @@ class Robot(object):
             grasp_success = not gripper_full_closed
 
             # Move the grasped object elsewhere
+            # if grasp_success:
+            #     object_positions = np.asarray(self.get_obj_positions())
+            #     object_positions = object_positions[:,2]
+            #     grasped_object_ind = np.argmax(object_positions)
+            #     grasped_object_handle = self.object_handles[grasped_object_ind]
+            #     vrep.simxSetObjectPosition(self.sim_client,grasped_object_handle,-1,(-0.5, 0.5 + 0.05*float(grasped_object_ind), 0.1),vrep.simx_opmode_blocking)
             if grasp_success:
+                # 安全参数配置
+                safe_lift_height = 0.15  # 统一提升高度
+                self.tool_acc = 0.5  # 安全加速度
+                self.tool_vel = 0.1  # 安全速度
+
+                # 获取被抓取物体信息
                 object_positions = np.asarray(self.get_obj_positions())
-                object_positions = object_positions[:,2]
-                grasped_object_ind = np.argmax(object_positions)
-                grasped_object_handle = self.object_handles[grasped_object_ind]
-                vrep.simxSetObjectPosition(self.sim_client,grasped_object_handle,-1,(-0.5, 0.5 + 0.05*float(grasped_object_ind), 0.1),vrep.simx_opmode_blocking)
+                grasped_object_ind = np.argmax(object_positions[:, 2])
+                place_offset = 0.01 * float(grasped_object_ind)+0.1
+
+                # 分阶段运动规划
+                # 1. 垂直抬升
+                lift_position = (position[0], position[1], position[2] + safe_lift_height)
+                self.move_to(lift_position, None)
+
+                # 2. 水平移动到放置点正上方
+                place_x = -0.6+0.03 * float(grasped_object_ind)
+                place_y = workspace_limits[1][1] + place_offset
+                hover_position = (place_x, place_y, lift_position[2])
+                self.move_to(hover_position, None)
+
+                # 3. 垂直下降
+                place_z = max(workspace_limits[2][0] + 0.02, position[2])
+                place_position = (place_x, place_y, place_z)
+                self.move_to(place_position, None)
+
+                # 4. 松开夹爪
+                self.open_gripper()
+
+                # 5. 安全返回
+                self.move_to(hover_position, None)
+                self.move_to(location_above_grasp_target, None)
 
         else:
 
