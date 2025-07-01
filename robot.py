@@ -11,6 +11,10 @@ class Robot(object):
     def __init__(self, is_sim, obj_mesh_dir, num_obj, workspace_limits,
                  tcp_host_ip, tcp_port, rtc_host_ip, rtc_port,
                  is_testing, test_preset_cases, test_preset_file):
+        
+        # 添加摞叠相关的变量
+        self.placed_objects_count = 0  # 已放置的物块数量
+        self.base_place_position = None  # 第一个物块的放置位置
 
         self.is_sim = is_sim
         self.workspace_limits = workspace_limits
@@ -193,6 +197,11 @@ class Robot(object):
 
 
     def restart_sim(self):
+
+        # 重置摞叠状态
+        self.placed_objects_count = 0
+        self.base_place_position = None
+        print("摞叠状态已重置")
 
         sim_ret, self.UR5_target_handle = vrep.simxGetObjectHandle(self.sim_client,'UR5_target',vrep.simx_opmode_blocking)
         vrep.simxSetObjectPosition(self.sim_client, self.UR5_target_handle, -1, (-0.5,0,0.3), vrep.simx_opmode_blocking)
@@ -667,30 +676,66 @@ class Robot(object):
                 # 获取被抓取物体信息
                 object_positions = np.asarray(self.get_obj_positions())
                 grasped_object_ind = np.argmax(object_positions[:, 2])
-                place_offset = 0.01 * float(grasped_object_ind)+0.1
+                
+                # 摞叠放置逻辑
+                if self.placed_objects_count == 0:
+                    # 第一个物块：使用公式计算放置位置
+                    place_offset = 0.01 * float(grasped_object_ind) + 0.1
+                    place_x = -0.6 + 0.03 * float(grasped_object_ind)
+                    place_y = workspace_limits[1][1] + place_offset
+                    place_z = max(workspace_limits[2][0] + 0.02, position[2])
+                    
+                    # 记录第一个物块的放置位置作为基准
+                    self.base_place_position = (place_x, place_y, place_z)
+                    print(f"第一个物块放置位置: ({place_x:.3f}, {place_y:.3f}, {place_z:.3f})")
+                else:
+                    # 后续物块：摞叠在同一个位置，但高度递增
+                    if self.base_place_position is not None:
+                        place_x, place_y, base_z = self.base_place_position
+                        # 每个物块高度增加0.03米（约3cm）
+                        place_z = base_z + 0.05 * self.placed_objects_count
+                        print(f"第{self.placed_objects_count + 1}个物块摞叠位置: ({place_x:.3f}, {place_y:.3f}, {place_z:.3f})")
+                    else:
+                        # 如果基准位置未设置，使用默认位置
+                        place_offset = 0.01 * float(grasped_object_ind) + 0.1
+                        place_x = -0.6 + 0.03 * float(grasped_object_ind)
+                        place_y = workspace_limits[1][1] + place_offset
+                        place_z = max(workspace_limits[2][0] + 0.02, position[2])
+                        print(f"警告：基准位置未设置，使用默认位置: ({place_x:.3f}, {place_y:.3f}, {place_z:.3f})")
 
                 # 分阶段运动规划
                 # 1. 垂直抬升
                 lift_position = (position[0], position[1], position[2] + safe_lift_height)
                 self.move_to(lift_position, None)
 
-                # 2. 水平移动到放置点正上方
-                place_x = -0.6+0.03 * float(grasped_object_ind)
-                place_y = workspace_limits[1][1] + place_offset
+                # 2. 旋转机械爪到平行于x轴的方向（仿照抓取函数的旋转逻辑）
+                target_rotation_angle = 0.0  # 平行于x轴
+                sim_ret, gripper_orientation = vrep.simxGetObjectOrientation(self.sim_client, self.UR5_target_handle, -1, vrep.simx_opmode_blocking)
+                rotation_step = 0.3 if (target_rotation_angle - gripper_orientation[1] > 0) else -0.3
+                num_rotation_steps = int(np.floor((target_rotation_angle - gripper_orientation[1])/rotation_step))
+                
+                # 执行旋转
+                for step_iter in range(num_rotation_steps):
+                    vrep.simxSetObjectOrientation(self.sim_client, self.UR5_target_handle, -1, (np.pi/2, gripper_orientation[1] + rotation_step*step_iter, np.pi/2), vrep.simx_opmode_blocking)
+                vrep.simxSetObjectOrientation(self.sim_client, self.UR5_target_handle, -1, (np.pi/2, target_rotation_angle, np.pi/2), vrep.simx_opmode_blocking)
+
+                # 3. 水平移动到放置点正上方
                 hover_position = (place_x, place_y, lift_position[2])
                 self.move_to(hover_position, None)
 
-                # 3. 垂直下降
-                place_z = max(workspace_limits[2][0] + 0.02, position[2])
+                # 4. 垂直下降
                 place_position = (place_x, place_y, place_z)
                 self.move_to(place_position, None)
 
-                # 4. 松开夹爪
+                # 5. 松开夹爪
                 self.open_gripper()
 
-                # 5. 安全返回
+                # 6. 安全返回
                 self.move_to(hover_position, None)
                 self.move_to(location_above_grasp_target, None)
+                
+                # 7. 更新已放置物块数量
+                self.placed_objects_count += 1
 
         else:
 
