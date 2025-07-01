@@ -704,8 +704,20 @@ class Robot(object):
                         print(f"警告：基准位置未设置，使用默认位置: ({place_x:.3f}, {place_y:.3f}, {place_z:.3f})")
 
                 # 分阶段运动规划
-                # 1. 垂直抬升
-                lift_position = (position[0], position[1], position[2] + safe_lift_height)
+                # 1. 垂直抬升（根据堆叠高度动态调整）
+                if self.placed_objects_count > 0 and self.base_place_position is not None:
+                    # 计算当前堆叠的高度
+                    _, _, base_z = self.base_place_position
+                    current_stack_height = base_z + 0.05 * self.placed_objects_count
+                    # 抬升高度 = 堆叠高度 + 安全距离
+                    dynamic_lift_height = current_stack_height + 0.1
+                    lift_position = (position[0], position[1], dynamic_lift_height)
+                    print(f"堆叠高度: {current_stack_height:.3f}m, 动态抬升高度: {dynamic_lift_height:.3f}m")
+                else:
+                    # 第一个物块或基准位置未设置时使用固定抬升高度
+                    lift_position = (position[0], position[1], position[2] + safe_lift_height)
+                    print(f"使用固定抬升高度: {safe_lift_height:.3f}m")
+                
                 self.move_to(lift_position, None)
 
                 # 2. 旋转机械爪到平行于x轴的方向（仿照抓取函数的旋转逻辑）
