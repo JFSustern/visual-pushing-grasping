@@ -148,10 +148,12 @@ class Robot(object):
 
     # 仿真相机参数设置
     def setup_sim_camera(self):
-
         # Get handle to camera
         sim_ret, self.cam_handle = vrep.simxGetObjectHandle(self.sim_client, 'Vision_sensor_persp',
                                                             vrep.simx_opmode_blocking)
+        # 新增：获取Vision_sensor_persp_1句柄
+        sim_ret, self.cam_handle_1 = vrep.simxGetObjectHandle(self.sim_client, 'Vision_sensor_persp_1',
+                                                              vrep.simx_opmode_blocking)
 
         # Get camera pose and intrinsics in simulation
         sim_ret, cam_position = vrep.simxGetObjectPosition(self.sim_client, self.cam_handle, -1,
@@ -165,6 +167,18 @@ class Robot(object):
         cam_rotm[0:3, 0:3] = np.linalg.inv(utils.euler2rotm(cam_orientation))
         self.cam_pose = np.dot(cam_trans, cam_rotm)  # Compute rigid transformation representating camera pose
 
+        # 新增：获取Vision_sensor_persp_1的位姿
+        sim_ret, cam1_position = vrep.simxGetObjectPosition(self.sim_client, self.cam_handle_1, -1,
+                                                            vrep.simx_opmode_blocking)
+        sim_ret, cam1_orientation = vrep.simxGetObjectOrientation(self.sim_client, self.cam_handle_1, -1,
+                                                                  vrep.simx_opmode_blocking)
+        cam1_trans = np.eye(4, 4)
+        cam1_trans[0:3, 3] = np.asarray(cam1_position)
+        cam1_orientation = [-cam1_orientation[0], -cam1_orientation[1], -cam1_orientation[2]]
+        cam1_rotm = np.eye(4, 4)
+        cam1_rotm[0:3, 0:3] = np.linalg.inv(utils.euler2rotm(cam1_orientation))
+        self.cam_pose_1 = np.dot(cam1_trans, cam1_rotm)
+
         # self.cam_intrinsics = np.asarray([[fx, 0, cx],[0, fy, cy],[0, 0, 1]])
         # fx, fy：焦距（以像素为单位）
         # cx, cy：主点坐标（图像中心）
@@ -172,9 +186,74 @@ class Robot(object):
 
         self.cam_depth_scale = 1
 
+        # 新增：初始化Vision_sensor_persp_1的内参和外参（如有需要，可后续补充）
+        # 这里只做句柄初始化，后续如需用到位姿和内参可补充
+
         # Get background image
         self.bg_color_img, self.bg_depth_img = self.get_camera_data()
         self.bg_depth_img = self.bg_depth_img * self.cam_depth_scale
+
+    # 新增：自动检测第一个物块的实际放置点
+    def detect_first_object_place_position(self):
+        color_img, depth_img = self.get_camera_data_1()
+        if color_img is None or depth_img is None:
+            print("未获取到Vision_sensor_persp_1图像")
+            return None
+        # 取深度图中最小非零值（最近的物体）
+        valid_mask = (depth_img > 0) & (~np.isnan(depth_img))
+        if not np.any(valid_mask):
+            print("未检测到物体")
+            return None
+        min_depth = np.nanmin(depth_img[valid_mask])
+        candidate_pixels = np.argwhere(depth_img == min_depth)
+        center_pixel = np.mean(candidate_pixels, axis=0).astype(int)
+        v, u = center_pixel  # 注意顺序
+        # 相机内参（根据Vision_sensor_persp_1参数）
+        fx = 640 / (2 * np.tan(np.deg2rad(54.7 / 2)))
+        fy = 480 / (2 * np.tan(np.deg2rad(54.7 / 2)))
+        cx, cy = 320, 240
+        z = min_depth
+        x = (u - cx) * z / fx
+        y = (v - cy) * z / fy
+        obj_cam = np.array([x, y, z, 1]).reshape(4, 1)
+        if not hasattr(self, 'cam_pose_1'):
+            print('请补充Vision_sensor_persp_1的位姿到self.cam_pose_1')
+            return None
+        obj_world = np.dot(self.cam_pose_1, obj_cam)
+        place_position = obj_world[:3, 0]
+        print(f"检测到第一个物块放置点: {place_position}")
+        return place_position
+
+    # 新增：获取Vision_sensor_persp_1的彩色和深度图像
+    def get_camera_data_1(self):
+        if self.is_sim:
+            # 直接blocking模式获取
+            sim_ret, resolution, raw_image = vrep.simxGetVisionSensorImage(self.sim_client, self.cam_handle_1, 0, vrep.simx_opmode_blocking)
+            if sim_ret == vrep.simx_return_ok and len(resolution) == 2 and len(raw_image) == resolution[0]*resolution[1]*3:
+                color_img = np.asarray(raw_image)
+                color_img.shape = (resolution[1], resolution[0], 3)
+                color_img = color_img.astype(np.float64) / 255
+                color_img[color_img < 0] += 1
+                color_img *= 255
+                color_img = np.fliplr(color_img)
+                color_img = color_img.astype(np.uint8)
+            else:
+                print("无法获取Vision_sensor_persp_1彩色图像")
+                return None, None
+            sim_ret, resolution, depth_buffer = vrep.simxGetVisionSensorDepthBuffer(self.sim_client, self.cam_handle_1, vrep.simx_opmode_blocking)
+            if sim_ret == vrep.simx_return_ok and len(resolution) == 2 and len(depth_buffer) == resolution[0]*resolution[1]:
+                depth_img = np.asarray(depth_buffer)
+                depth_img.shape = (resolution[1], resolution[0])
+                depth_img = np.fliplr(depth_img)
+                zNear = 0.01
+                zFar = 10
+                depth_img = depth_img * (zFar - zNear) + zNear
+            else:
+                print("无法获取Vision_sensor_persp_1深度图像")
+                return None, None
+            return color_img, depth_img
+        else:
+            return None, None
 
     def add_objects(self):
 
@@ -527,8 +606,8 @@ class Robot(object):
 
             for step_iter in range(num_move_steps):
                 vrep.simxSetObjectPosition(self.sim_client, self.UR5_target_handle, -1, (
-                UR5_target_position[0] + move_step[0], UR5_target_position[1] + move_step[1],
-                UR5_target_position[2] + move_step[2]), vrep.simx_opmode_blocking)
+                    UR5_target_position[0] + move_step[0], UR5_target_position[1] + move_step[1],
+                    UR5_target_position[2] + move_step[2]), vrep.simx_opmode_blocking)
                 sim_ret, UR5_target_position = vrep.simxGetObjectPosition(self.sim_client, self.UR5_target_handle, -1,
                                                                           vrep.simx_opmode_blocking)
             vrep.simxSetObjectPosition(self.sim_client, self.UR5_target_handle, -1,
@@ -540,8 +619,8 @@ class Robot(object):
             self.tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.tcp_socket.connect((self.tcp_host_ip, self.tcp_port))
             tcp_command = "movel(p[%f,%f,%f,%f,%f,%f],a=%f,v=%f,t=0,r=0)\n" % (
-            tool_position[0], tool_position[1], tool_position[2], tool_orientation[0], tool_orientation[1],
-            tool_orientation[2], self.tool_acc, self.tool_vel)
+                tool_position[0], tool_position[1], tool_position[2], tool_orientation[0], tool_orientation[1],
+                tool_orientation[2], self.tool_acc, self.tool_vel)
             self.tcp_socket.send(str.encode(tcp_command))
 
             # Block until robot reaches target tool position
@@ -586,8 +665,8 @@ class Robot(object):
 
             # Move to next increment position (blocking call)
             tcp_command = "movel(p[%f,%f,%f,%f,%f,%f],a=%f,v=%f,t=0,r=0)\n" % (
-            increment_position[0], increment_position[1], increment_position[2], tool_orientation[0],
-            tool_orientation[1], tool_orientation[2], self.tool_acc, self.tool_vel)
+                increment_position[0], increment_position[1], increment_position[2], tool_orientation[0],
+                tool_orientation[1], tool_orientation[2], self.tool_acc, self.tool_vel)
             self.tcp_socket.send(str.encode(tcp_command))
 
             time_start = time.time()
@@ -611,7 +690,7 @@ class Robot(object):
             # print(TCP_forces[0:3])
             if np.linalg.norm(np.asarray(TCP_forces[0:2])) > 20 or (time_snapshot - time_start) > 1:
                 print('Warning: contact detected! Movement halted. TCP forces: [%f, %f, %f]' % (
-                TCP_forces[0], TCP_forces[1], TCP_forces[2]))
+                    TCP_forces[0], TCP_forces[1], TCP_forces[2]))
                 execute_success = False
                 break
 
@@ -695,11 +774,11 @@ class Robot(object):
             # Simultaneously move and rotate gripper
             for step_iter in range(max(num_move_steps, num_rotation_steps)):
                 vrep.simxSetObjectPosition(self.sim_client, self.UR5_target_handle, -1, (
-                UR5_target_position[0] + move_step[0] * min(step_iter, num_move_steps),
-                UR5_target_position[1] + move_step[1] * min(step_iter, num_move_steps),
-                UR5_target_position[2] + move_step[2] * min(step_iter, num_move_steps)), vrep.simx_opmode_blocking)
+                    UR5_target_position[0] + move_step[0] * min(step_iter, num_move_steps),
+                    UR5_target_position[1] + move_step[1] * min(step_iter, num_move_steps),
+                    UR5_target_position[2] + move_step[2] * min(step_iter, num_move_steps)), vrep.simx_opmode_blocking)
                 vrep.simxSetObjectOrientation(self.sim_client, self.UR5_target_handle, -1, (
-                np.pi / 2, gripper_orientation[1] + rotation_step * min(step_iter, num_rotation_steps), np.pi / 2),
+                    np.pi / 2, gripper_orientation[1] + rotation_step * min(step_iter, num_rotation_steps), np.pi / 2),
                                               vrep.simx_opmode_blocking)
             vrep.simxSetObjectPosition(self.sim_client, self.UR5_target_handle, -1,
                                        (tool_position[0], tool_position[1], tool_position[2]),
@@ -742,30 +821,25 @@ class Robot(object):
 
                 # 摞叠放置逻辑
                 if self.placed_objects_count == 0:
-                    # 第一个物块：使用公式计算放置位置
-                    place_offset = 0.01 * float(grasped_object_ind) + 0.1
-                    place_x = -0.6 + 0.03 * float(grasped_object_ind)
+                    # 第一个物块：只用硬编码公式
+                    place_offset = 0.2
+                    place_x = -0.3
                     place_y = workspace_limits[1][1] + place_offset
                     place_z = max(workspace_limits[2][0] + 0.02, position[2])
-
-                    # 记录第一个物块的放置位置作为基准
-                    self.base_place_position = (place_x, place_y, place_z)
-                    print(f"第一个物块放置位置: ({place_x:.3f}, {place_y:.3f}, {place_z:.3f})")
+                    self.base_place_position = (place_x, place_y, place_z)  # 记录硬编码位置
+                    print(f"第一个物块放置位置(硬编码): ({place_x:.3f}, {place_y:.3f}, {place_z:.3f})")
                 else:
-                    # 后续物块：摞叠在同一个位置，但高度递增
-                    if self.base_place_position is not None:
-                        place_x, place_y, base_z = self.base_place_position
-                        # 每个物块高度增加0.03米（约3cm）
-                        place_z = base_z + 0.05 * self.placed_objects_count
-                        print(
-                            f"第{self.placed_objects_count + 1}个物块摞叠位置: ({place_x:.3f}, {place_y:.3f}, {place_z:.3f})")
+                    # 后续物块：用视觉检测第一个物块的实际位置
+                    detected_place = self.detect_first_object_place_position()
+                    if detected_place is not None:
+                        place_x, place_y, detected_z = detected_place
+                        place_z = detected_z + 0.05 * (self.placed_objects_count)
+                        print(f"第{self.placed_objects_count + 1}个物块摞叠位置(视觉): ({place_x:.3f}, {place_y:.3f}, {place_z:.3f})")
                     else:
-                        # 如果基准位置未设置，使用默认位置
-                        place_offset = 0.01 * float(grasped_object_ind) + 0.1
-                        place_x = -0.6 + 0.03 * float(grasped_object_ind)
-                        place_y = workspace_limits[1][1] + place_offset
-                        place_z = max(workspace_limits[2][0] + 0.02, position[2])
-                        print(f"警告：基准位置未设置，使用默认位置: ({place_x:.3f}, {place_y:.3f}, {place_z:.3f})")
+                        # 检测失败时回退到第一个物块的硬编码位置
+                        place_x, place_y, base_z = self.base_place_position
+                        place_z = base_z + 0.05 * self.placed_objects_count
+                        print(f"第{self.placed_objects_count + 1}个物块摞叠位置(回退): ({place_x:.3f}, {place_y:.3f}, {place_z:.3f})")
 
                 # 分阶段运动规划
                 # 1. 垂直抬升（根据堆叠高度动态调整）
@@ -794,7 +868,7 @@ class Robot(object):
                 # 执行旋转
                 for step_iter in range(num_rotation_steps):
                     vrep.simxSetObjectOrientation(self.sim_client, self.UR5_target_handle, -1, (
-                    np.pi / 2, gripper_orientation[1] + rotation_step * step_iter, np.pi / 2),
+                        np.pi / 2, gripper_orientation[1] + rotation_step * step_iter, np.pi / 2),
                                                   vrep.simx_opmode_blocking)
                 vrep.simxSetObjectOrientation(self.sim_client, self.UR5_target_handle, -1,
                                               (np.pi / 2, target_rotation_angle, np.pi / 2), vrep.simx_opmode_blocking)
@@ -847,11 +921,12 @@ class Robot(object):
             tcp_command = "def process():\n"
             tcp_command += " set_digital_out(8,False)\n"
             tcp_command += " movej(p[%f,%f,%f,%f,%f,%f],a=%f,v=%f,t=0,r=0.09)\n" % (
-            position[0], position[1], position[2] + 0.1, tool_orientation[0], tool_orientation[1], 0.0,
-            self.joint_acc * 0.5, self.joint_vel * 0.5)
+                position[0], position[1], position[2] + 0.1, tool_orientation[0], tool_orientation[1], 0.0,
+                self.joint_acc * 0.5, self.joint_vel * 0.5)
             tcp_command += " movej(p[%f,%f,%f,%f,%f,%f],a=%f,v=%f,t=0,r=0.00)\n" % (
-            position[0], position[1], position[2], tool_orientation[0], tool_orientation[1], 0.0, self.joint_acc * 0.1,
-            self.joint_vel * 0.1)
+                position[0], position[1], position[2], tool_orientation[0], tool_orientation[1], 0.0,
+                self.joint_acc * 0.1,
+                self.joint_vel * 0.1)
             tcp_command += " set_digital_out(8,True)\n"
             tcp_command += "end\n"
             self.tcp_socket.send(str.encode(tcp_command))
@@ -893,15 +968,16 @@ class Robot(object):
                 self.tcp_socket.connect((self.tcp_host_ip, self.tcp_port))
                 tcp_command = "def process():\n"
                 tcp_command += " movej(p[%f,%f,%f,%f,%f,%f],a=%f,v=%f,t=0,r=%f)\n" % (
-                position[0], position[1], bin_position[2], tool_orientation[0], tool_orientation[1], 0.0,
-                self.joint_acc, self.joint_vel, blend_radius)
+                    position[0], position[1], bin_position[2], tool_orientation[0], tool_orientation[1], 0.0,
+                    self.joint_acc, self.joint_vel, blend_radius)
                 tcp_command += " movej(p[%f,%f,%f,%f,%f,%f],a=%f,v=%f,t=0,r=%f)\n" % (
-                bin_position[0], bin_position[1], bin_position[2], tilted_tool_orientation[0],
-                tilted_tool_orientation[1], tilted_tool_orientation[2], self.joint_acc, self.joint_vel, blend_radius)
+                    bin_position[0], bin_position[1], bin_position[2], tilted_tool_orientation[0],
+                    tilted_tool_orientation[1], tilted_tool_orientation[2], self.joint_acc, self.joint_vel,
+                    blend_radius)
                 tcp_command += " set_digital_out(8,False)\n"
                 tcp_command += " movej(p[%f,%f,%f,%f,%f,%f],a=%f,v=%f,t=0,r=0.0)\n" % (
-                home_position[0], home_position[1], home_position[2], tool_orientation[0], tool_orientation[1], 0.0,
-                self.joint_acc * 0.5, self.joint_vel * 0.5)
+                    home_position[0], home_position[1], home_position[2], tool_orientation[0], tool_orientation[1], 0.0,
+                    self.joint_acc * 0.5, self.joint_vel * 0.5)
                 tcp_command += "end\n"
                 self.tcp_socket.send(str.encode(tcp_command))
                 self.tcp_socket.close()
@@ -930,11 +1006,11 @@ class Robot(object):
                 self.tcp_socket.connect((self.tcp_host_ip, self.tcp_port))
                 tcp_command = "def process():\n"
                 tcp_command += " movej(p[%f,%f,%f,%f,%f,%f],a=%f,v=%f,t=0,r=0.09)\n" % (
-                position[0], position[1], position[2] + 0.1, tool_orientation[0], tool_orientation[1], 0.0,
-                self.joint_acc * 0.5, self.joint_vel * 0.5)
+                    position[0], position[1], position[2] + 0.1, tool_orientation[0], tool_orientation[1], 0.0,
+                    self.joint_acc * 0.5, self.joint_vel * 0.5)
                 tcp_command += " movej(p[%f,%f,%f,%f,%f,%f],a=%f,v=%f,t=0,r=0.0)\n" % (
-                home_position[0], home_position[1], home_position[2], tool_orientation[0], tool_orientation[1], 0.0,
-                self.joint_acc * 0.5, self.joint_vel * 0.5)
+                    home_position[0], home_position[1], home_position[2], tool_orientation[0], tool_orientation[1], 0.0,
+                    self.joint_acc * 0.5, self.joint_vel * 0.5)
                 tcp_command += "end\n"
                 self.tcp_socket.send(str.encode(tcp_command))
                 self.tcp_socket.close()
@@ -997,11 +1073,11 @@ class Robot(object):
             # Simultaneously move and rotate gripper
             for step_iter in range(max(num_move_steps, num_rotation_steps)):
                 vrep.simxSetObjectPosition(self.sim_client, self.UR5_target_handle, -1, (
-                UR5_target_position[0] + move_step[0] * min(step_iter, num_move_steps),
-                UR5_target_position[1] + move_step[1] * min(step_iter, num_move_steps),
-                UR5_target_position[2] + move_step[2] * min(step_iter, num_move_steps)), vrep.simx_opmode_blocking)
+                    UR5_target_position[0] + move_step[0] * min(step_iter, num_move_steps),
+                    UR5_target_position[1] + move_step[1] * min(step_iter, num_move_steps),
+                    UR5_target_position[2] + move_step[2] * min(step_iter, num_move_steps)), vrep.simx_opmode_blocking)
                 vrep.simxSetObjectOrientation(self.sim_client, self.UR5_target_handle, -1, (
-                np.pi / 2, gripper_orientation[1] + rotation_step * min(step_iter, num_rotation_steps), np.pi / 2),
+                    np.pi / 2, gripper_orientation[1] + rotation_step * min(step_iter, num_rotation_steps), np.pi / 2),
                                               vrep.simx_opmode_blocking)
             vrep.simxSetObjectPosition(self.sim_client, self.UR5_target_handle, -1,
                                        (tool_position[0], tool_position[1], tool_position[2]),
@@ -1076,20 +1152,22 @@ class Robot(object):
             tcp_command = "def process():\n"
             tcp_command += " set_digital_out(8,True)\n"
             tcp_command += " movej(p[%f,%f,%f,%f,%f,%f],a=%f,v=%f,t=0,r=0.09)\n" % (
-            position[0], position[1], position[2] + 0.1, tool_orientation[0], tool_orientation[1], tool_orientation[2],
-            self.joint_acc * 0.5, self.joint_vel * 0.5)
+                position[0], position[1], position[2] + 0.1, tool_orientation[0], tool_orientation[1],
+                tool_orientation[2],
+                self.joint_acc * 0.5, self.joint_vel * 0.5)
             tcp_command += " movej(p[%f,%f,%f,%f,%f,%f],a=%f,v=%f,t=0,r=0.00)\n" % (
-            position[0], position[1], position[2], tool_orientation[0], tool_orientation[1], tool_orientation[2],
-            self.joint_acc * 0.1, self.joint_vel * 0.1)
+                position[0], position[1], position[2], tool_orientation[0], tool_orientation[1], tool_orientation[2],
+                self.joint_acc * 0.1, self.joint_vel * 0.1)
             tcp_command += " movej(p[%f,%f,%f,%f,%f,%f],a=%f,v=%f,t=0,r=0.00)\n" % (
-            push_endpoint[0], push_endpoint[1], push_endpoint[2], tilted_tool_orientation[0],
-            tilted_tool_orientation[1], tilted_tool_orientation[2], self.joint_acc * 0.1, self.joint_vel * 0.1)
+                push_endpoint[0], push_endpoint[1], push_endpoint[2], tilted_tool_orientation[0],
+                tilted_tool_orientation[1], tilted_tool_orientation[2], self.joint_acc * 0.1, self.joint_vel * 0.1)
             tcp_command += " movej(p[%f,%f,%f,%f,%f,%f],a=%f,v=%f,t=0,r=0.03)\n" % (
-            position[0], position[1], position[2] + 0.1, tool_orientation[0], tool_orientation[1], tool_orientation[2],
-            self.joint_acc * 0.5, self.joint_vel * 0.5)
+                position[0], position[1], position[2] + 0.1, tool_orientation[0], tool_orientation[1],
+                tool_orientation[2],
+                self.joint_acc * 0.5, self.joint_vel * 0.5)
             tcp_command += " movej(p[%f,%f,%f,%f,%f,%f],a=%f,v=%f,t=0,r=0.00)\n" % (
-            home_position[0], home_position[1], home_position[2], tool_orientation[0], tool_orientation[1],
-            tool_orientation[2], self.joint_acc * 0.5, self.joint_vel * 0.5)
+                home_position[0], home_position[1], home_position[2], tool_orientation[0], tool_orientation[1],
+                tool_orientation[2], self.joint_acc * 0.5, self.joint_vel * 0.5)
             tcp_command += "end\n"
             self.tcp_socket.send(str.encode(tcp_command))
             self.tcp_socket.close()
@@ -1133,11 +1211,11 @@ class Robot(object):
         tcp_command = "def process():\n"
         tcp_command += " set_digital_out(8,False)\n"
         tcp_command += " movej(p[%f,%f,%f,%f,%f,%f],a=%f,v=%f,t=0,r=0.09)\n" % (
-        box_grab_position[0], box_grab_position[1], box_grab_position[2] + 0.1, tilted_tool_orientation[0],
-        tilted_tool_orientation[1], tilted_tool_orientation[2], self.joint_acc, self.joint_vel)
+            box_grab_position[0], box_grab_position[1], box_grab_position[2] + 0.1, tilted_tool_orientation[0],
+            tilted_tool_orientation[1], tilted_tool_orientation[2], self.joint_acc, self.joint_vel)
         tcp_command += " movej(p[%f,%f,%f,%f,%f,%f],a=%f,v=%f,t=0,r=0.00)\n" % (
-        box_grab_position[0], box_grab_position[1], box_grab_position[2], tool_orientation[0], tool_orientation[1],
-        tool_orientation[2], self.joint_acc, self.joint_vel)
+            box_grab_position[0], box_grab_position[1], box_grab_position[2], tool_orientation[0], tool_orientation[1],
+            tool_orientation[2], self.joint_acc, self.joint_vel)
         tcp_command += " set_digital_out(8,True)\n"
         tcp_command += "end\n"
         self.tcp_socket.send(str.encode(tcp_command))
@@ -1163,30 +1241,31 @@ class Robot(object):
         self.tcp_socket.connect((self.tcp_host_ip, self.tcp_port))
         tcp_command = "def process():\n"
         tcp_command += " movej(p[%f,%f,%f,%f,%f,%f],a=%f,v=%f,t=0,r=0.00)\n" % (
-        box_release_position[0], box_release_position[1], box_release_position[2], tool_orientation[0],
-        tool_orientation[1], tool_orientation[2], self.joint_acc * 0.1, self.joint_vel * 0.1)
+            box_release_position[0], box_release_position[1], box_release_position[2], tool_orientation[0],
+            tool_orientation[1], tool_orientation[2], self.joint_acc * 0.1, self.joint_vel * 0.1)
         tcp_command += " movej(p[%f,%f,%f,%f,%f,%f],a=%f,v=%f,t=0,r=0.00)\n" % (
-        box_release_position[0], box_release_position[1], box_release_position[2] + 0.3, tool_orientation[0],
-        tool_orientation[1], tool_orientation[2], self.joint_acc * 0.02, self.joint_vel * 0.02)
+            box_release_position[0], box_release_position[1], box_release_position[2] + 0.3, tool_orientation[0],
+            tool_orientation[1], tool_orientation[2], self.joint_acc * 0.02, self.joint_vel * 0.02)
         tcp_command += " movej(p[%f,%f,%f,%f,%f,%f],a=%f,v=%f,t=0,r=0.29)\n" % (
-        box_grab_position[0] - 0.05, box_grab_position[1] + 0.1, box_grab_position[2] + 0.3, tilted_tool_orientation[0],
-        tilted_tool_orientation[1], tilted_tool_orientation[2], self.joint_acc * 0.5, self.joint_vel * 0.5)
+            box_grab_position[0] - 0.05, box_grab_position[1] + 0.1, box_grab_position[2] + 0.3,
+            tilted_tool_orientation[0],
+            tilted_tool_orientation[1], tilted_tool_orientation[2], self.joint_acc * 0.5, self.joint_vel * 0.5)
         tcp_command += " movej(p[%f,%f,%f,%f,%f,%f],a=%f,v=%f,t=0,r=0.00)\n" % (
-        box_grab_position[0] - 0.05, box_grab_position[1] + 0.1, box_grab_position[2], tool_orientation[0],
-        tool_orientation[1], tool_orientation[2], self.joint_acc * 0.5, self.joint_vel * 0.5)
+            box_grab_position[0] - 0.05, box_grab_position[1] + 0.1, box_grab_position[2], tool_orientation[0],
+            tool_orientation[1], tool_orientation[2], self.joint_acc * 0.5, self.joint_vel * 0.5)
         tcp_command += " movej(p[%f,%f,%f,%f,%f,%f],a=%f,v=%f,t=0,r=0.00)\n" % (
-        box_grab_position[0], box_grab_position[1], box_grab_position[2], tool_orientation[0], tool_orientation[1],
-        tool_orientation[2], self.joint_acc * 0.1, self.joint_vel * 0.1)
+            box_grab_position[0], box_grab_position[1], box_grab_position[2], tool_orientation[0], tool_orientation[1],
+            tool_orientation[2], self.joint_acc * 0.1, self.joint_vel * 0.1)
         tcp_command += " movej(p[%f,%f,%f,%f,%f,%f],a=%f,v=%f,t=0,r=0.00)\n" % (
-        box_grab_position[0] + 0.05, box_grab_position[1], box_grab_position[2], tool_orientation[0],
-        tool_orientation[1], tool_orientation[2], self.joint_acc * 0.1, self.joint_vel * 0.1)
+            box_grab_position[0] + 0.05, box_grab_position[1], box_grab_position[2], tool_orientation[0],
+            tool_orientation[1], tool_orientation[2], self.joint_acc * 0.1, self.joint_vel * 0.1)
         tcp_command += " set_digital_out(8,False)\n"
         tcp_command += " movej(p[%f,%f,%f,%f,%f,%f],a=%f,v=%f,t=0,r=0.09)\n" % (
-        box_grab_position[0], box_grab_position[1], box_grab_position[2] + 0.1, tilted_tool_orientation[0],
-        tilted_tool_orientation[1], tilted_tool_orientation[2], self.joint_acc, self.joint_vel)
+            box_grab_position[0], box_grab_position[1], box_grab_position[2] + 0.1, tilted_tool_orientation[0],
+            tilted_tool_orientation[1], tilted_tool_orientation[2], self.joint_acc, self.joint_vel)
         tcp_command += " movej(p[%f,%f,%f,%f,%f,%f],a=%f,v=%f,t=0,r=0.00)\n" % (
-        home_position[0], home_position[1], home_position[2], tool_orientation[0], tool_orientation[1],
-        tool_orientation[2], self.joint_acc, self.joint_vel)
+            home_position[0], home_position[1], home_position[2], tool_orientation[0], tool_orientation[1],
+            tool_orientation[2], self.joint_acc, self.joint_vel)
         tcp_command += "end\n"
         self.tcp_socket.send(str.encode(tcp_command))
         self.tcp_socket.close()
