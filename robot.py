@@ -221,7 +221,7 @@ class Robot(object):
             return None
         obj_world = np.dot(self.cam_pose_1, obj_cam)
         place_position = obj_world[:3, 0]
-        print(f"检测到第一个物块放置点: {place_position}")
+        print(f"检测到放置点: {place_position}")
         return place_position
 
     # 新增：获取Vision_sensor_persp_1的彩色和深度图像
@@ -822,7 +822,7 @@ class Robot(object):
                 # 摞叠放置逻辑
                 if self.placed_objects_count == 0:
                     # 第一个物块：只用硬编码公式
-                    place_offset = 0.2
+                    place_offset = 0.3
                     place_x = -0.3
                     place_y = workspace_limits[1][1] + place_offset
                     place_z = max(workspace_limits[2][0] + 0.02, position[2])
