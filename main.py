@@ -18,6 +18,27 @@ from logger import Logger
 import utils
 
 
+def calculate_place_stability(robot, place_position):
+    """计算放置稳定性评分"""
+    try:
+        # 获取放置后物体的位置
+        object_positions = np.asarray(robot.get_obj_positions())
+        
+        # 计算物体是否在预期位置附近
+        expected_pos = np.array(place_position)
+        distances = np.linalg.norm(object_positions - expected_pos, axis=1)
+        
+        # 找到最近的物体
+        min_distance = np.min(distances)
+        
+        # 稳定性评分：距离越近，评分越高
+        stability_score = max(0, 1.0 - min_distance / 0.1)  # 10cm容差
+        
+        return stability_score
+    except:
+        return 0.5  # 默认中等稳定性
+
+
 def main(args):
 
 
@@ -200,6 +221,68 @@ def main(args):
                 elif nonlocal_variables['primitive_action'] == 'grasp':
                     nonlocal_variables['grasp_success'] = robot.grasp(primitive_position, best_rotation_angle, workspace_limits)
                     print('Grasp successful: %r' % (nonlocal_variables['grasp_success']))
+                    
+                    # 如果抓取成功，执行放置训练逻辑
+                    if nonlocal_variables['grasp_success']:
+                        # 获取放置后的场景图像
+                        time.sleep(0.5)  # 等待场景稳定
+                        color_img, depth_img = robot.get_camera_data()
+                        
+                        if color_img is not None and depth_img is not None:
+                            # 创建高度图用于放置训练
+                            color_heightmap = color_img
+                            depth_heightmap = depth_img
+                            
+                            # 使用放置网络预测放置位置
+                            place_predictions, _ = trainer.forward_place(color_heightmap, depth_heightmap, is_volatile=True)
+                            
+                            # 选择最佳放置位置
+                            best_place_pix_ind = np.unravel_index(np.argmax(place_predictions), place_predictions.shape)
+                            place_predicted_value = np.max(place_predictions)
+                            
+                            print(f'Placement prediction: ({best_place_pix_ind[0]}, {best_place_pix_ind[1]}, {best_place_pix_ind[2]}) with confidence {place_predicted_value:.3f}')
+                            
+                            # 计算放置位置（像素坐标转换为世界坐标）
+                            heightmap_resolution = 0.002
+                            place_x = best_place_pix_ind[2] * heightmap_resolution + workspace_limits[0][0]
+                            place_y = best_place_pix_ind[1] * heightmap_resolution + workspace_limits[1][0]
+                            place_z = depth_heightmap[best_place_pix_ind[1]][best_place_pix_ind[2]] + workspace_limits[2][0]
+                            
+                            # 执行放置动作
+                            place_position = [place_x, place_y, place_z]
+                            place_success = robot.place_object(place_position)
+                            
+                            # 评估放置结果
+                            if place_success:
+                                # 计算稳定性评分
+                                stability_score = calculate_place_stability(robot, place_position)
+                                print(f'Placement successful, stability score: {stability_score:.3f}')
+                            else:
+                                stability_score = 0.0
+                                print('Placement failed')
+                            
+                            # 计算放置标签值
+                            place_label_value = trainer.get_place_label_value(place_success, stability_score)
+                            
+                            # 训练放置网络
+                            trainer.backprop_place(color_heightmap, depth_heightmap, best_place_pix_ind, place_label_value)
+                            
+                            # 记录放置日志
+                            trainer.executed_place_log.append([best_place_pix_ind[0], best_place_pix_ind[1], best_place_pix_ind[2]])
+                            trainer.place_label_value_log.append([place_label_value])
+                            trainer.place_predicted_value_log.append([place_predicted_value])
+                            
+                            # 保存放置可视化
+                            if save_visualizations:
+                                place_pred_vis = trainer.get_prediction_vis(place_predictions, color_heightmap, best_place_pix_ind)
+                                logger.save_visualizations(trainer.iteration, place_pred_vis, 'place')
+                                cv2.imwrite('visualization.place.png', place_pred_vis)
+                            
+                            # 更新已放置物块数量
+                            robot.placed_objects_count += 1
+                        else:
+                            # 如果无法获取图像，使用启发式放置
+                            robot.execute_heuristic_placement(color_img, depth_img, workspace_limits)
 
                 nonlocal_variables['executing_action'] = False
 
